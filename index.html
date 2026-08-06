@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Météo LPAOSF — Sénégal</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <meta name="theme-color" content="#0f766e" />
+  <meta name="description" content="Prévisions météo pour les 14 régions du Sénégal" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="assets/icon-192.png" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-inner">
+      <span class="logo">🌦️</span>
+      <h1>Météo LPAOSF</h1>
+      <span class="subtitle">Sénégal — 14 régions</span>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Contrôles -->
+    <section class="controls-card">
+      <div class="control-group">
+        <label for="region">📍 Région</label>
+        <select id="region">
+          <option value="">Toutes les régions</option>
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label for="parameter">📊 Variable</label>
+        <select id="parameter">
+          <option value="general">Vue générale</option>
+          <option value="temperature">Température (max)</option>
+          <option value="precipitation">Probabilité de pluie</option>
+          <option value="humidity">Humidité relative</option>
+          <option value="wind">Vent (max)</option>
+          <option value="uv">Indice UV</option>
+          <option value="cape">CAPE (instabilité)</option>
+          <option value="surface_pressure">Pression surface</option>
+          <option value="soil_temperature_0_to_7cm">Temp. sol 0-7 cm</option>
+          <option value="soil_moisture_0_to_7cm">Humidité sol 0-7 cm</option>
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label for="date">📅 Jour</label>
+        <select id="date">
+          <option value="">Aujourd'hui (carte)</option>
+        </select>
+      </div>
+
+      <button id="searchBtn" class="search-btn">
+        <span class="btn-icon">🔍</span>
+        <span class="btn-text">Actualiser les données</span>
+      </button>
+    </section>
+
+    <!-- Carte -->
+    <section id="mapSection" class="map-section">
+      <div class="section-header">
+        <h2>🗺️ Carte des prévisions</h2>
+        <span id="mapLegend" class="legend-badge">Choisir une variable</span>
+      </div>
+      <div id="map"></div>
+      <p class="map-hint">💡 Cliquez sur une région pour voir le détail · Changez la variable pour mettre à jour la carte</p>
+    </section>
+
+    <!-- Cartes météo -->
+    <section id="weatherDisplay" class="weather-cards"></section>
+
+    <!-- Tableau horaire -->
+    <details id="hourlyDetails" class="hourly-details">
+      <summary>
+        <span>📊 Prévisions heure par heure</span>
+        <span class="chevron">›</span>
+      </summary>
+      <div id="hourlyTable" class="hourly-table-wrapper"></div>
+    </details>
+  </main>
+
+  <footer class="app-footer">
+    <p>Données © Open-Meteo · Application LPAOSF</p>
+  </footer>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module" src="js/app.js"></script>
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('service-worker.js').catch(() => {});
+    }
+  </script>
+</body>
+</html>
