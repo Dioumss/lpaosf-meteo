@@ -1,316 +1,471 @@
 // ============================================
-// app.js — Main application logic
+// app.js — Logique principale de Météo LPAOSF
 // ============================================
 
+import { REGIONS, REGION_BY_KEY, loadForecast, getCachedForecast, MAX_AGE_MS } from './api.js';
 import {
-  REGIONS,
-  fetchDaily,
-  fetchHourly,
-  mapDailyToApp,
-  mapHourlyToApp,
-  aggregateHourlyToDaily
-} from './api.js';
-import { initMap, showMap, updateMapLabels } from './map.js';
+  VARIABLES, VARIABLE_ORDER, colorFor, textOn, formatValue, classIndex,
+  describeWeather, weatherIcon, windDirection
+} from './config.js';
+import { initMap, updateMap } from './map.js';
 
-/* ---------- DOM refs ---------- */
-const regionSel   = document.getElementById('region');
-const paramSel    = document.getElementById('parameter');
-const dateSel     = document.getElementById('date');
-const searchBtn   = document.getElementById('searchBtn');
-const display     = document.getElementById('weatherDisplay');
-const hourlyDet   = document.getElementById('hourlyDetails');
-const hourlyTbl   = document.getElementById('hourlyTable');
-const mapLegend   = document.getElementById('mapLegend');
-
-/* ---------- Fill selects ---------- */
-Object.keys(REGIONS).forEach(r => {
-  const opt = document.createElement('option');
-  opt.value = r;
-  opt.textContent = r.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  regionSel.appendChild(opt);
-});
-
-for (let i = 0; i < 14; i++) {
-  const d = new Date();
-  d.setDate(d.getDate() + i);
-  const iso = d.toISOString().split('T')[0];
-  const label = d.toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric', month: 'short' });
-  const opt = document.createElement('option');
-  opt.value = iso;
-  opt.textContent = i === 0 ? `Aujourd'hui — ${label}` : label;
-  dateSel.appendChild(opt);
+/* ---------- Préférences (mémorisées dans le navigateur) ---------- */
+const PREF_KEY = 'lpaosf:prefs:v2';
+function readPrefs() {
+  try { return JSON.parse(localStorage.getItem(PREF_KEY)) || {}; } catch { return {}; }
+}
+function savePrefs() {
+  try { localStorage.setItem(PREF_KEY, JSON.stringify({ region: state.region, varKey: state.varKey })); } catch { /* ignore */ }
 }
 
-/* ---------- Caches ---------- */
-const dailyCache = {};
-const hourlyCache = {}; // { region: { date: [hours] } }
-const extraCache = {};  // { region: { date: { cape, surfacePressure, soilTemp, soilMoisture } } }
-
-/* ---------- Legend labels ---------- */
-const PARAM_LABELS = {
-  general: 'Vue générale',
-  temperature: 'Température max',
-  precipitation: 'Probabilité de pluie',
-  humidity: 'Humidité relative',
-  wind: 'Vent max',
-  uv: 'Indice UV',
-  cape: 'CAPE (instabilité)',
-  surface_pressure: 'Pression surface',
-  soil_temperature_0_to_7cm: 'Température sol',
-  soil_moisture_0_to_7cm: 'Humidité sol'
+const prefs = readPrefs();
+const state = {
+  data: null,
+  fetchedAt: null,
+  fromCache: false,
+  error: null,
+  loading: false,
+  region: REGION_BY_KEY[prefs.region] ? prefs.region : 'dakar',
+  varKey: VARIABLES[prefs.varKey] ? prefs.varKey : 'tempMax',
+  date: null
 };
 
-/* ---------- Event wiring ---------- */
-searchBtn.addEventListener('click', onSearch);
-paramSel.addEventListener('change', onParamChange);
+/* ---------- DOM ---------- */
+const $ = id => document.getElementById(id);
+const el = {
+  status: $('status'), refresh: $('refreshBtn'), banner: $('banner'),
+  regionSelect: $('regionSelect'), chips: $('variableChips'), days: $('dayStrip'),
+  mapSubtitle: $('mapSubtitle'), mapError: $('mapError'), legend: $('legend'),
+  ranking: $('rankingList'), detail: $('detail')
+};
 
-async function onSearch() {
-  const region = regionSel.value;
-  const param  = paramSel.value;
-  const date   = dateSel.value;
+/* ---------- Dates (toujours en heure de Dakar) ---------- */
+const TZ = 'Africa/Dakar';
+function todayDakar() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+/** Formate une date « AAAA-MM-JJ » sans décalage de fuseau. */
+function fmtDate(iso, opts) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('fr-FR', { timeZone: 'UTC', ...opts });
+}
+function fmtTime(ts) {
+  return new Date(ts).toLocaleTimeString('fr-FR', { timeZone: TZ, hour: '2-digit', minute: '2-digit' });
+}
+function relativeDay(iso) {
+  const t = todayDakar();
+  if (iso === t) return "Aujourd'hui";
+  const [y, m, d] = t.split('-').map(Number);
+  const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
+  if (iso === tomorrow) return 'Demain';
+  return capitalize(fmtDate(iso, { weekday: 'long' }));
+}
+const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  searchBtn.disabled = true;
-  searchBtn.querySelector('.btn-text').textContent = 'Chargement…';
-  display.innerHTML = '<div class="loading">⏳ Récupération des données météo…</div>';
-  showMap(false);
-  hourlyDet.open = false;
-  hourlyDet.style.display = 'none';
+/** Jours disponibles à partir d'aujourd'hui (un cache de la veille est recadré). */
+function availableDates() {
+  if (!state.data) return [];
+  const t = todayDakar();
+  return state.data.dates.filter(d => d >= t);
+}
 
-  try {
-    // 1) Fetch daily for ALL regions (needed for the map)
-    const regionsToFetch = Object.keys(REGIONS);
-    const dailyPromises = regionsToFetch.map(async k => {
-      if (!dailyCache[k]) {
-        const raw = await fetchDaily(k);
-        dailyCache[k] = mapDailyToApp(raw);
-      }
-      return [k, dailyCache[k]];
-    });
-    const dailyEntries = await Promise.all(dailyPromises);
-    const dailyData = Object.fromEntries(dailyEntries);
+function dayFor(regionKey, date) {
+  return state.data?.regions[regionKey]?.days.find(d => d.date === date) || null;
+}
 
-    // 2) Fetch extra hourly data (CAPE, pressure, soil) for all regions if needed
-    const needsExtra = ['cape','surface_pressure','soil_temperature_0_to_7cm','soil_moisture_0_to_7cm'].includes(param);
-    const today = new Date().toISOString().split('T')[0];
-    const targetDate = date || today;
+/* ---------- Contrôles ---------- */
+function buildControls() {
+  el.regionSelect.innerHTML = REGIONS
+    .slice().sort((a, b) => a.name.localeCompare(b.name, 'fr'))
+    .map(r => `<option value="${r.key}">${r.name}</option>`).join('');
+  el.regionSelect.value = state.region;
+  el.regionSelect.addEventListener('change', () => selectRegion(el.regionSelect.value));
 
-    if (needsExtra) {
-      const extraPromises = regionsToFetch.map(async k => {
-        if (!extraCache[k]?.[targetDate]) {
-          const raw = await fetchHourly(k, targetDate);
-          const hours = mapHourlyToApp(raw);
-          extraCache[k] = extraCache[k] || {};
-          extraCache[k][targetDate] = aggregateHourlyToDaily(hours);
-        }
-        if (extraCache[k]?.[targetDate] && dailyData[k]?.[targetDate]) {
-          Object.assign(dailyData[k][targetDate].daytime, extraCache[k][targetDate]);
-        }
-        return [k, dailyData[k]];
-      });
-      await Promise.all(extraPromises);
-    }
+  el.chips.innerHTML = VARIABLE_ORDER.map(k => `
+    <button type="button" class="chip" role="radio" data-var="${k}" title="${VARIABLES[k].label}">${VARIABLES[k].short}</button>`).join('');
+  el.chips.addEventListener('click', e => {
+    const b = e.target.closest('[data-var]');
+    if (!b) return;
+    state.varKey = b.dataset.var;
+    savePrefs();
+    renderAll();
+  });
 
-    // 3) Determine what to show
-    const selectedRegion = region;
-    const selectedDate   = date;
+  el.days.addEventListener('click', e => {
+    const b = e.target.closest('[data-date]');
+    if (!b) return;
+    state.date = b.dataset.date;
+    renderAll();
+  });
 
-    let regionsToShow = selectedRegion ? [selectedRegion] : Object.keys(REGIONS);
-    let datesToShow;
-    if (selectedDate) {
-      datesToShow = [selectedDate];
-    } else if (selectedRegion) {
-      // One region, no date → show all 14 days
-      datesToShow = Object.keys(dailyData[selectedRegion] || {}).sort();
-    } else {
-      // No region, no date → show all regions for today only
-      datesToShow = [today];
-    }
+  el.detail.addEventListener('click', e => {
+    const row = e.target.closest('[data-date]');
+    if (row) { state.date = row.dataset.date; renderAll(); }
+  });
 
-    let html = '';
-    regionsToShow.forEach(r => {
-      datesToShow.forEach(d => {
-        if (dailyData[r]?.[d]) {
-          html += buildDailyCard(r, param, dailyData[r][d], d);
-        }
-      });
-    });
-    display.innerHTML = html || '<div class="empty">Aucune donnée disponible.</div>';
+  el.ranking.addEventListener('click', e => {
+    const li = e.target.closest('[data-region]');
+    if (li) selectRegion(li.dataset.region);
+  });
 
-    // 4) Update map with labels
-    updateMapLabels(dailyData, param, date, (clickedRegion) => {
-      regionSel.value = clickedRegion;
-      onSearch();
-      window.scrollTo({ top: 0, behavior: 'smooth' });
-    });
-    showMap(true);
-    mapLegend.textContent = PARAM_LABELS[param] || param;
+  el.refresh.addEventListener('click', () => refresh({ force: true }));
+}
 
-    // 5) Hourly table if single region + single date
-    if (selectedRegion && selectedDate) {
-      hourlyDet.style.display = 'block';
-      hourlyTbl.innerHTML = '<div class="loading">⏳ Chargement des horaires…</div>';
-
-      if (!hourlyCache[selectedRegion]?.[selectedDate]) {
-        const rawHourly = await fetchHourly(selectedRegion, selectedDate);
-        hourlyCache[selectedRegion] = hourlyCache[selectedRegion] || {};
-        hourlyCache[selectedRegion][selectedDate] = mapHourlyToApp(rawHourly);
-      }
-      hourlyTbl.innerHTML = buildHourlyTable(hourlyCache[selectedRegion][selectedDate]);
-    }
-
-  } catch (e) {
-    console.error(e);
-    display.innerHTML = `<div class="error">❌ Impossible de récupérer les données.<br><small>${e.message}</small></div>`;
-    showMap(false);
-    hourlyDet.style.display = 'none';
-  } finally {
-    searchBtn.disabled = false;
-    searchBtn.querySelector('.btn-text').textContent = 'Actualiser les données';
+function selectRegion(key) {
+  if (!REGION_BY_KEY[key]) return;
+  state.region = key;
+  el.regionSelect.value = key;
+  savePrefs();
+  renderAll();
+  if (window.matchMedia('(max-width: 960px)').matches) {
+    document.querySelector('.detail-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 }
 
-/* When parameter changes, just refresh map + cards if data already loaded */
-async function onParamChange() {
-  const param = paramSel.value;
-  const date  = dateSel.value;
-  const region = regionSel.value;
+/* ---------- Rendu ---------- */
+function renderAll() {
+  renderStatus();
+  if (!state.data) return;
 
-  mapLegend.textContent = PARAM_LABELS[param] || param;
-
-  const hasData = Object.keys(dailyCache).length === Object.keys(REGIONS).length;
-  if (!hasData) return;
-
-  const today = new Date().toISOString().split('T')[0];
-  const targetDate = date || today;
-
-  // Handle extra data if needed
-  const needsExtra = ['cape','surface_pressure','soil_temperature_0_to_7cm','soil_moisture_0_to_7cm'].includes(param);
-  if (needsExtra) {
-    const regionsToFetch = Object.keys(REGIONS);
-    const extraPromises = regionsToFetch.map(async k => {
-      if (!extraCache[k]?.[targetDate]) {
-        const raw = await fetchHourly(k, targetDate);
-        const hours = mapHourlyToApp(raw);
-        extraCache[k] = extraCache[k] || {};
-        extraCache[k][targetDate] = aggregateHourlyToDaily(hours);
-      }
-      if (extraCache[k]?.[targetDate] && dailyCache[k]?.[targetDate]) {
-        Object.assign(dailyCache[k][targetDate].daytime, extraCache[k][targetDate]);
-      }
-    });
-    await Promise.all(extraPromises);
+  const dates = availableDates();
+  if (!dates.length) {
+    el.detail.innerHTML = '<p class="empty">Les données en cache sont trop anciennes. Actualisez pour obtenir les prévisions du jour.</p>';
+    return;
   }
+  if (!dates.includes(state.date)) state.date = dates[0];
 
-  // Re-render cards
-  let regionsToShow = region ? [region] : Object.keys(REGIONS);
-  let datesToShow;
-  if (date) {
-    datesToShow = [date];
-  } else if (region) {
-    datesToShow = Object.keys(dailyCache[region] || {}).sort();
+  renderChips();
+  renderDays(dates);
+  renderMapAndLegend();
+  renderRanking();
+  renderDetail(dates);
+}
+
+function renderStatus() {
+  const { fetchedAt, fromCache, error, loading } = state;
+  el.refresh.classList.toggle('is-spinning', loading);
+  el.refresh.disabled = loading;
+
+  if (loading && !fetchedAt) { el.status.textContent = 'Chargement…'; }
+  else if (loading) { el.status.textContent = 'Actualisation…'; }
+  else if (fetchedAt) { el.status.textContent = `${fromCache && error ? 'Hors ligne · ' : ''}Mis à jour à ${fmtTime(fetchedAt)}`; }
+  else { el.status.textContent = 'Indisponible'; }
+  el.status.classList.toggle('is-warn', !!(fromCache && error));
+
+  const age = fetchedAt ? Date.now() - fetchedAt : 0;
+  if (error && fetchedAt) {
+    el.banner.hidden = false;
+    el.banner.className = 'banner is-warn';
+    el.banner.innerHTML = `Actualisation impossible (${esc(error.message)}). Affichage des prévisions du ${new Date(fetchedAt).toLocaleDateString('fr-FR', { timeZone: TZ, day: 'numeric', month: 'long' })} à ${fmtTime(fetchedAt)}. <button type="button" class="link-btn" data-retry>Réessayer</button>`;
+    el.banner.querySelector('[data-retry]').onclick = () => refresh({ force: true });
+  } else if (age > 6 * 3600 * 1000 && !loading) {
+    el.banner.hidden = false;
+    el.banner.className = 'banner is-warn';
+    el.banner.textContent = `Ces prévisions datent de plus de 6 heures.`;
   } else {
-    datesToShow = [today];
+    el.banner.hidden = true;
   }
+}
 
-  let html = '';
-  regionsToShow.forEach(r => {
-    datesToShow.forEach(d => {
-      if (dailyCache[r]?.[d]) {
-        html += buildDailyCard(r, param, dailyCache[r][d], d);
-      }
-    });
-  });
-  display.innerHTML = html || '<div class="empty">Aucune donnée.</div>';
-
-  // Re-render map labels
-  updateMapLabels(dailyCache, param, date, (clickedRegion) => {
-    regionSel.value = clickedRegion;
-    onSearch();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+function renderChips() {
+  el.chips.querySelectorAll('.chip').forEach(b => {
+    const on = b.dataset.var === state.varKey;
+    b.classList.toggle('is-active', on);
+    b.setAttribute('aria-checked', on);
   });
 }
 
-/* ---------- Card builder ---------- */
-function buildDailyCard(region, param, data, date) {
-  const d = data.daytime;
-  const fmtDate = new Date(date).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
+function renderDays(dates) {
+  el.days.innerHTML = dates.map((d, i) => {
+    const on = d === state.date;
+    const top = i === 0 ? "Auj." : capitalize(fmtDate(d, { weekday: 'short' }).replace('.', ''));
+    return `<button type="button" class="day${on ? ' is-active' : ''}" role="radio" aria-checked="${on}" data-date="${d}" aria-label="${relativeDay(d)} ${fmtDate(d, { day: 'numeric', month: 'long' })}">
+      <span class="day-name">${top}</span><span class="day-num">${fmtDate(d, { day: 'numeric' })}</span>
+    </button>`;
+  }).join('');
+  el.days.querySelector('.is-active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
 
-  let html = `<div class="weather-card">
-    <div class="card-header">
-      <div class="card-title">${region.replace(/-/g, ' ')}</div>
-      <div class="day-badge">${fmtDate}</div>
+function valuesFor(varKey, date) {
+  return Object.fromEntries(REGIONS.map(r => [r.key, dayFor(r.key, date)?.[varKey] ?? null]));
+}
+
+function renderMapAndLegend() {
+  const v = VARIABLES[state.varKey];
+  const values = valuesFor(state.varKey, state.date);
+  el.mapSubtitle.textContent = `${v.label}${v.unit ? ` (${v.unit})` : ''} · ${relativeDay(state.date)} ${fmtDate(state.date, { day: 'numeric', month: 'long' })}`;
+  updateMap(values, state.varKey, state.region);
+
+  const labels = v.colors.map((_, i) => {
+    if (v.classLabels) return v.classLabels[i];
+    const lo = v.breaks[i - 1], hi = v.breaks[i];
+    const f = n => n.toLocaleString('fr-FR');
+    if (i === 0) return `< ${f(hi)}`;
+    if (i === v.colors.length - 1) return `≥ ${f(lo)}`;
+    return `${f(lo)}–${f(hi)}`;
+  });
+  el.legend.innerHTML = `<span class="legend-unit">${v.unit || 'Indice'}</span>` + v.colors.map((c, i) =>
+    `<span class="legend-item"><span class="legend-swatch" style="background:${c}"></span>${labels[i]}</span>`).join('');
+}
+
+function renderRanking() {
+  const values = valuesFor(state.varKey, state.date);
+  const v = VARIABLES[state.varKey];
+  const sorted = REGIONS.slice().sort((a, b) => (values[b.key] ?? -Infinity) - (values[a.key] ?? -Infinity));
+  el.ranking.innerHTML = sorted.map(r => {
+    const val = values[r.key];
+    const c = colorFor(state.varKey, val) || '#cbd5e1';
+    return `<li data-region="${r.key}" class="${r.key === state.region ? 'is-selected' : ''}">
+      <button type="button"><span class="rank-name">${r.name}</span>
+      <span class="rank-val" style="background:${c};color:${textOn(c)}">${formatValue(state.varKey, val)} ${v.unit}</span></button></li>`;
+  }).join('');
+}
+
+/* ---------- Panneau détail ---------- */
+function renderDetail(dates) {
+  const region = REGION_BY_KEY[state.region];
+  const rd = state.data.regions[state.region];
+  const day = dayFor(state.region, state.date);
+  if (!day) { el.detail.innerHTML = '<p class="empty">Aucune donnée pour ce jour.</p>'; return; }
+  const isToday = state.date === todayDakar();
+  const wx = describeWeather(isToday ? rd.current.weatherCode : day.weatherCode);
+
+  const hero = isToday ? `
+    <div class="hero">
+      <div class="hero-main">
+        ${weatherIcon(rd.current.weatherCode, { isDay: rd.current.isDay, size: 72 })}
+        <div>
+          <div class="hero-temp">${formatValue('tempMax', rd.current.temperature)}<span>°C</span></div>
+          <div class="hero-cond">${wx.label}</div>
+        </div>
+      </div>
+      <dl class="hero-facts">
+        <div><dt>Ressenti</dt><dd>${formatValue('tempMax', rd.current.apparent)} °C</dd></div>
+        <div><dt>Humidité</dt><dd>${rd.current.humidity ?? '–'} %</dd></div>
+        <div><dt>Vent</dt><dd>${formatValue('windMax', rd.current.wind)} km/h ${windDirection(rd.current.windDir)}</dd></div>
+        <div><dt>Journée</dt><dd>${formatValue('tempMin', day.tempMin)} / ${formatValue('tempMax', day.tempMax)} °C</dd></div>
+      </dl>
+      <p class="hero-note">Observation modélisée à ${rd.current.time.slice(11, 16)} (heure de Dakar)</p>
+    </div>` : `
+    <div class="hero">
+      <div class="hero-main">
+        ${weatherIcon(day.weatherCode, { size: 72 })}
+        <div>
+          <div class="hero-temp">${formatValue('tempMax', day.tempMax)}<span>°C</span></div>
+          <div class="hero-cond">${wx.label} · min ${formatValue('tempMin', day.tempMin)} °C</div>
+        </div>
+      </div>
+    </div>`;
+
+  const uvClass = day.uv != null ? VARIABLES.uv.classLabels[classIndex('uv', day.uv)] : '';
+  const capeClass = day.cape != null ? VARIABLES.cape.classLabels[classIndex('cape', day.cape)] : '';
+  const stats = [
+    ['Pluie', `${formatValue('precipSum', day.precipSum)} mm`, `Probabilité ${day.precipProbability ?? '–'} %`],
+    ['Vent max', `${formatValue('windMax', day.windMax)} km/h`, day.windDir != null ? `Dominant ${windDirection(day.windDir)}` : ''],
+    ['Humidité', `${day.humidity ?? '–'} %`, 'Moyenne journalière'],
+    ['UV max', `${formatValue('uv', day.uv)}`, uvClass],
+    ['CAPE max', `${formatValue('cape', day.cape)} J/kg`, capeClass ? `Instabilité ${capeClass.toLowerCase()}` : ''],
+    ['Pression', `${formatValue('pressure', day.pressure)} hPa`, 'Moyenne en surface'],
+    ['Sol 0–7 cm', `${formatValue('soilTemp', day.soilTemp)} °C`, `Humidité ${formatValue('soilMoisture', day.soilMoisture)} m³/m³`],
+    ['Soleil', `${day.sunrise ?? '–'}–${day.sunset ?? '–'}`, 'Lever – coucher']
+  ];
+
+  const alerts = attentionPoints(day);
+
+  el.detail.innerHTML = `
+    <div class="detail-head">
+      <h2 id="regionName" class="region-name">${region.name}</h2>
+      <p class="region-date">${relativeDay(state.date)} ${fmtDate(state.date, { day: 'numeric', month: 'long' })}</p>
     </div>
-    <div class="weather-grid">`;
+    ${hero}
+    ${alerts.length ? `<ul class="alerts" aria-label="Points d'attention">${alerts.map(a => `<li class="alert alert-${a.level}">${a.text}</li>`).join('')}</ul>` : ''}
+    <div class="stats">${stats.map(([k, v, s]) => `
+      <div class="stat"><div class="stat-label">${k}</div><div class="stat-value">${v}</div>${s ? `<div class="stat-sub">${s}</div>` : ''}</div>`).join('')}
+    </div>
 
-  switch (param) {
-    case 'temperature':
-      html += item('🌡️ Max', `${d.temperature?.max ?? '-'} °C`)
-           +  item('❄️ Min', `${d.temperature?.min ?? '-'} °C`);
-      break;
-    case 'precipitation':
-      html += item('☔ Probabilité', `${d.precipitation?.probability ?? '-'} %`)
-           +  item('🌧️ Cumul', `${d.precipitation?.amount ?? '-'} mm`);
-      break;
-    case 'humidity':
-      html += item('💧 Humidité', `${d.humidity ?? '-'} %`);
-      break;
-    case 'wind':
-      html += item('💨 Vent max', `${d.wind?.speed ?? '-'} km/h`);
-      break;
-    case 'uv':
-      html += item('☀️ UV max', `${d.uv ?? '-'}`);
-      break;
-    case 'cape':
-      html += item('⚡ CAPE', `${d.cape ?? '-'} J/kg`);
-      break;
-    case 'surface_pressure':
-      html += item('📉 Pression', `${d.surfacePressure ?? '-'} hPa`);
-      break;
-    case 'soil_temperature_0_to_7cm':
-      html += item('🌱 Temp. sol', `${d.soilTemp ?? '-'} °C`);
-      break;
-    case 'soil_moisture_0_to_7cm':
-      html += item('🌱 Humidité sol', `${d.soilMoisture ?? '-'} m³/m³`);
-      break;
-    default:
-      html += item('🌡️ Température', `${d.temperature?.min ?? '-'} – ${d.temperature?.max ?? '-'} °C`, true)
-           +  item('☔ Pluie', `${d.precipitation?.probability ?? '-'} %`)
-           +  item('💧 Humidité', `${d.humidity ?? '-'} %`)
-           +  item('💨 Vent', `${d.wind?.speed ?? '-'} km/h`)
-           +  item('☀️ UV', `${d.uv ?? '-'}`);
-  }
-  html += '</div></div>';
-  return html;
+    <h3 class="section-title">Heure par heure</h3>
+    <div class="hourly-chart" id="hourlyChart">${hourlyChart(day.hours)}</div>
+
+    <h3 class="section-title">Prévisions sur ${dates.length} jours</h3>
+    <ol class="forecast">${forecastRows(rd, dates)}</ol>
+    <p class="disclaimer">Seuils d'attention indicatifs. Pour la vigilance officielle, consultez les bulletins de l'ANACIM.</p>
+  `;
+  wireChart();
 }
 
-function item(label, value, full = false) {
-  return `<div class="weather-item ${full ? 'full-width' : ''}">
-    <div class="item-label">${label}</div>
-    <div class="item-value">${value}</div>
-  </div>`;
+function attentionPoints(day) {
+  const out = [];
+  if (day.tempMax >= 40) out.push({ level: 'high', text: `Forte chaleur : ${formatValue('tempMax', day.tempMax)} °C attendus.` });
+  else if (day.tempMax >= 37) out.push({ level: 'mid', text: `Chaleur marquée : ${formatValue('tempMax', day.tempMax)} °C.` });
+  if (day.precipSum >= 20) out.push({ level: 'high', text: `Fortes pluies : ${formatValue('precipSum', day.precipSum)} mm prévus.` });
+  else if (day.precipSum >= 5 && day.precipProbability >= 50) out.push({ level: 'mid', text: `Pluie probable : ${formatValue('precipSum', day.precipSum)} mm (${day.precipProbability} %).` });
+  if (day.cape >= 2500 && day.precipProbability >= 40) out.push({ level: 'mid', text: `Atmosphère très instable (CAPE ${formatValue('cape', day.cape)} J/kg) : orages possibles.` });
+  if (day.windMax >= 50) out.push({ level: 'high', text: `Vent fort : rafales moyennes jusqu'à ${formatValue('windMax', day.windMax)} km/h.` });
+  if (day.uv >= 11) out.push({ level: 'mid', text: `UV extrêmes (${formatValue('uv', day.uv)}) : protection indispensable.` });
+  return out;
 }
 
-/* ---------- Hourly table ---------- */
-function buildHourlyTable(arr) {
-  if (!arr || arr.length === 0) return '<div class="empty">Aucune donnée horaire.</div>';
-  return `<table>
-    <thead><tr>
-      <th>Heure</th><th>Temp °C</th><th>Pluie mm</th><th>Vent km/h</th>
-      <th>CAPE</th><th>Pression hPa</th><th>Sol °C</th><th>Nuages %</th>
-    </tr></thead>
-    <tbody>${arr.map(h => `<tr>
-      <td>${h.hour}</td>
-      <td>${h.temperature ?? '-'}</td>
-      <td>${h.rain ?? '-'}</td>
-      <td>${h.windSpeed ?? '-'}</td>
-      <td>${h.cape ?? '-'}</td>
-      <td>${h.surfacePressure ?? '-'}</td>
-      <td>${h.soilTemp ?? '-'}</td>
-      <td>${h.cloudCover ?? '-'}</td>
-    </tr>`).join('')}</tbody>
-  </table>`;
+function forecastRows(rd, dates) {
+  const days = rd.days.filter(d => dates.includes(d.date));
+  const lo = Math.min(...days.map(d => d.tempMin ?? Infinity));
+  const hi = Math.max(...days.map(d => d.tempMax ?? -Infinity));
+  const span = Math.max(hi - lo, 1);
+  return days.map(d => {
+    const left = ((d.tempMin - lo) / span) * 100;
+    const width = Math.max(((d.tempMax - d.tempMin) / span) * 100, 4);
+    const on = d.date === state.date;
+    const wx = describeWeather(d.weatherCode);
+    return `<li><button type="button" class="fc-row${on ? ' is-active' : ''}" data-date="${d.date}" aria-pressed="${on}">
+      <span class="fc-day">${d.date === dates[0] ? "Aujourd'hui" : capitalize(fmtDate(d.date, { weekday: 'short', day: 'numeric' }))}</span>
+      <span class="fc-icon" title="${wx.label}">${weatherIcon(d.weatherCode, { size: 28 })}</span>
+      <span class="fc-rain${d.precipProbability >= 30 ? ' is-visible' : ''}">${d.precipProbability ?? 0} %</span>
+      <span class="fc-min">${formatValue('tempMin', d.tempMin)}°</span>
+      <span class="fc-bar" aria-hidden="true"><span style="left:${left}%;width:${width}%"></span></span>
+      <span class="fc-max">${formatValue('tempMax', d.tempMax)}°</span>
+    </button></li>`;
+  }).join('');
 }
 
-/* ---------- Init ---------- */
-initMap();
-onSearch();
+/* ---------- Graphique horaire (SVG, sans dépendance) ---------- */
+let chartHours = [];
+let chartW = 640;
+function hourlyChart(hours) {
+  chartHours = hours;
+  if (!hours.length) return '<p class="empty">Pas de données horaires.</p>';
+  // Largeur réelle du conteneur : le texte garde sa taille sur mobile
+  chartW = Math.max(300, Math.min(720, Math.round(el.detail.clientWidth || 640)));
+  const W = chartW, H = W < 480 ? 180 : 200, P = { l: 34, r: 34, t: 18, b: 28 };
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const temps = hours.map(h => h.temperature).filter(v => v != null);
+  const tMin = Math.floor(Math.min(...temps) - 1), tMax = Math.ceil(Math.max(...temps) + 1);
+  const pMax = Math.max(5, ...hours.map(h => h.precipitation ?? 0));
+  const x = i => P.l + (i + 0.5) * (iw / hours.length);
+  const yT = t => P.t + ih - ((t - tMin) / (tMax - tMin)) * ih;
+  const yP = p => P.t + ih - (p / pMax) * ih;
+  const bw = (iw / hours.length) * 0.6;
+
+  const line = hours.map((h, i) => h.temperature == null ? null : `${x(i).toFixed(1)},${yT(h.temperature).toFixed(1)}`).filter(Boolean);
+  const area = `M${line[0]} L${line.join(' L')} L${x(hours.length - 1).toFixed(1)},${P.t + ih} L${x(0).toFixed(1)},${P.t + ih} Z`;
+  const bars = hours.map((h, i) => h.precipitation > 0
+    ? `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${yP(h.precipitation).toFixed(1)}" width="${bw.toFixed(1)}" height="${(P.t + ih - yP(h.precipitation)).toFixed(1)}" rx="1.5" class="bar"/>` : '').join('');
+  const ticksT = [tMin, Math.round((tMin + tMax) / 2), tMax];
+  const step = W < 480 ? 6 : 3;
+  const xLabels = hours.map((h, i) => i % step === 0 ? `<text x="${x(i).toFixed(1)}" y="${H - 8}" class="axis" text-anchor="middle">${h.hour.slice(0, 2)}h</text>` : '').join('');
+
+  return `
+  <div class="chart-legend"><span class="key key-temp"></span>Température (°C)<span class="key key-rain"></span>Pluie (mm/h)</div>
+  <svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Température et pluie heure par heure">
+    ${ticksT.map(t => `<line x1="${P.l}" x2="${W - P.r}" y1="${yT(t)}" y2="${yT(t)}" class="grid"/><text x="${P.l - 6}" y="${yT(t) + 4}" class="axis" text-anchor="end">${t}°</text>`).join('')}
+    <text x="${W - P.r + 6}" y="${P.t + 4}" class="axis axis-rain">${pMax.toFixed(0)}</text>
+    <text x="${W - P.r + 6}" y="${P.t + ih + 4}" class="axis axis-rain">0</text>
+    ${bars}
+    <path d="${area}" class="temp-area"/>
+    <polyline points="${line.join(' ')}" class="temp-line"/>
+    ${xLabels}
+    <line class="cursor" x1="0" x2="0" y1="${P.t}" y2="${P.t + ih}" visibility="hidden"/>
+    <circle class="cursor-dot" r="4" cx="0" cy="0" visibility="hidden"/>
+    <rect class="hit" x="${P.l}" y="${P.t}" width="${iw}" height="${ih}" fill="transparent"/>
+  </svg>
+  <div class="chart-tip" hidden></div>`;
+}
+
+function wireChart() {
+  const box = document.getElementById('hourlyChart');
+  const svg = box?.querySelector('svg');
+  if (!svg || !chartHours.length) return;
+  const tip = box.querySelector('.chart-tip');
+  const cursor = svg.querySelector('.cursor');
+  const dot = svg.querySelector('.cursor-dot');
+  const line = svg.querySelector('.temp-line').points;
+  const W = chartW, P = { l: 34, r: 34 };
+  const iw = W - P.l - P.r;
+
+  const show = evt => {
+    const rect = svg.getBoundingClientRect();
+    const sx = ((evt.clientX - rect.left) / rect.width) * W;
+    const i = Math.min(chartHours.length - 1, Math.max(0, Math.floor(((sx - P.l) / iw) * chartHours.length)));
+    const h = chartHours[i];
+    const pt = line[i];
+    if (!pt) return;
+    cursor.setAttribute('x1', pt.x); cursor.setAttribute('x2', pt.x);
+    dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
+    cursor.setAttribute('visibility', 'visible'); dot.setAttribute('visibility', 'visible');
+    tip.hidden = false;
+    tip.innerHTML = `<strong>${h.hour}</strong> · ${describeWeather(h.weatherCode).label}<br>
+      ${formatValue('tempMax', h.temperature)} °C · pluie ${formatValue('precipSum', h.precipitation)} mm (${h.precipProbability ?? '–'} %)<br>
+      vent ${formatValue('windMax', h.wind)} km/h · humidité ${h.humidity ?? '–'} %`;
+    const px = (pt.x / W) * rect.width;
+    tip.style.left = `${Math.min(Math.max(px, 90), rect.width - 90)}px`;
+  };
+  const hide = () => {
+    tip.hidden = true;
+    cursor.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden');
+  };
+  svg.addEventListener('pointermove', show);
+  svg.addEventListener('pointerdown', show);
+  svg.addEventListener('pointerleave', hide);
+}
+
+/* ---------- Chargement ---------- */
+let inflight = null;
+async function refresh({ force = false } = {}) {
+  if (inflight) return inflight;
+  if (!force && state.fetchedAt && Date.now() - state.fetchedAt < MAX_AGE_MS) return;
+  state.loading = true;
+  renderStatus();
+  inflight = (async () => {
+    try {
+      const res = await loadForecast({
+        onRetry: (n, total) => { el.status.textContent = `Connexion lente, tentative ${n}/${total}…`; }
+      });
+      Object.assign(state, { data: res.data, fetchedAt: res.fetchedAt, fromCache: res.fromCache, error: res.error });
+    } catch (error) {
+      state.error = error;
+      if (!state.data) showFatalError(error);
+    } finally {
+      state.loading = false;
+      inflight = null;
+      renderAll();
+    }
+  })();
+  return inflight;
+}
+
+function showFatalError(error) {
+  const node = document.getElementById('errorTpl').content.cloneNode(true);
+  node.querySelector('.error-msg').textContent = `${error.message}. Vérifiez votre connexion puis réessayez.`;
+  node.querySelector('.retry').addEventListener('click', () => refresh({ force: true }));
+  el.detail.replaceChildren(node);
+}
+
+/* ---------- Démarrage ---------- */
+async function start() {
+  buildControls();
+
+  // Affichage immédiat depuis le cache, puis actualisation en arrière-plan.
+  const cached = getCachedForecast();
+  if (cached) Object.assign(state, { data: cached.data, fetchedAt: cached.fetchedAt, fromCache: true });
+
+  initMap('map', { onRegionSelect: selectRegion })
+    .then(() => renderAll())
+    .catch(err => {
+      console.error(err);
+      el.mapError.hidden = false;
+      el.mapError.textContent = 'Carte indisponible (fond de carte ou limites non chargés). Les prévisions restent consultables ci-contre.';
+    });
+
+  renderAll();
+  await refresh({ force: !cached || Date.now() - cached.fetchedAt >= MAX_AGE_MS });
+
+  // Actualisation automatique : retour sur l'onglet, retour du réseau, toutes les 30 min.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+  window.addEventListener('online', () => refresh({ force: true }));
+  setInterval(() => { if (!document.hidden) refresh(); }, 5 * 60 * 1000);
+}
+
+start();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('service-worker.js').catch(() => {}));
+}

@@ -1,120 +1,134 @@
 // ============================================
-// map.js — Leaflet map with region value labels
+// map.js — Carte choroplèthe des 14 régions (Leaflet)
 // ============================================
 
-import { REGIONS } from './api.js';
+import { REGION_BY_ISO } from './api.js';
+import { VARIABLES, colorFor, textOn, formatValue } from './config.js';
 
-let map = null;
-let layers = [];
+const SENEGAL_BOUNDS = [[12.25, -17.6], [16.75, -11.3]];
+// Carte thématique sans fond tuilé : aucune dépendance à un fournisseur de
+// tuiles (les fonds CARTO exigent désormais une clé et affichent un filigrane).
+// Ajustements manuels de la position des étiquettes (régions côtières serrées)
+const LABEL_OVERRIDES = { 'SN-DK': [14.70, -17.42], 'SN-TH': [14.80, -16.78] };
 
-export function initMap() {
-  if (map) return map;
+const PLACE_LABELS = [
+  { text: 'Océan Atlantique', at: [13.6, -17.25], cls: 'sea' },
+  { text: 'Gambie', at: [13.42, -15.5], cls: 'country' },
+  { text: 'Mauritanie', at: [16.55, -13.3], cls: 'country' },
+  { text: 'Mali', at: [14.2, -11.75], cls: 'country' },
+  { text: 'Guinée', at: [12.38, -12.9], cls: 'country' },
+  { text: 'Guinée-Bissau', at: [12.3, -15.6], cls: 'country' }
+];
 
-  map = L.map('map', {
+let map, geoLayer, labelLayer;
+let geojson = null;
+let onSelect = () => {};
+let state = { values: {}, varKey: 'tempMax', selected: null };
+
+export async function initMap(container, { onRegionSelect }) {
+  onSelect = onRegionSelect;
+  if (typeof L === 'undefined') throw new Error('Leaflet non chargé');
+
+  map = L.map(container, {
     zoomControl: false,
-    attributionControl: false
-  }).setView([14.5, -14.5], 7);
-
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors &copy; <a href="https://carto.com/">CARTO</a>',
-    subdomains: 'abcd',
-    maxZoom: 19
-  }).addTo(map);
-
-  L.control.attribution({ position: 'bottomright' }).addTo(map);
+    attributionControl: true,
+    zoomSnap: 0.25,
+    minZoom: 5,
+    maxZoom: 10,
+    maxBounds: [[10.5, -20], [18.5, -9.5]]
+  });
+  map.attributionControl.setPrefix(false);
+  map.attributionControl.addAttribution('Limites : <a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a>');
   L.control.zoom({ position: 'topright' }).addTo(map);
 
-  return map;
+  PLACE_LABELS.forEach(p => L.marker(p.at, {
+    icon: L.divIcon({ className: `place-label place-${p.cls}`, html: `<span>${p.text}</span>`, iconSize: [0, 0] }),
+    interactive: false, keyboard: false
+  }).addTo(map));
+
+  map.fitBounds(SENEGAL_BOUNDS, { padding: [4, 4] });
+  // Étiquettes compactes (valeur seule) quand la carte est petite
+  const updateDensity = () => map.getContainer().classList.toggle('labels-compact', map.getZoom() < 6.9);
+  map.on('zoomend', updateDensity);
+  updateDensity();
+  let userMoved = false;
+  map.on('dragstart', () => { userMoved = true; });
+  map.on('zoomstart', e => { if (e.originalEvent) userMoved = true; });
+  new ResizeObserver(entries => {
+    const { width, height } = entries[0].contentRect;
+    if (!width || !height) return;
+    map.invalidateSize();
+    if (!userMoved) map.fitBounds(SENEGAL_BOUNDS, { padding: [4, 4] });
+  }).observe(document.getElementById(container));
+
+  const res = await fetch('assets/regions.geojson');
+  geojson = await res.json();
+
+  geoLayer = L.geoJSON(geojson, {
+    style: styleFor,
+    onEachFeature: (feature, layer) => {
+      const region = REGION_BY_ISO[feature.properties.iso];
+      if (!region) return;
+      layer.on({
+        click: () => onSelect(region.key),
+        mouseover: () => layer.setStyle({ weight: 2.5 }),
+        mouseout: () => geoLayer.resetStyle(layer)
+      });
+    }
+  }).addTo(map);
+  labelLayer = L.layerGroup().addTo(map);
+  render();
 }
 
-export function showMap(show = true) {
-  const section = document.getElementById('mapSection');
-  section.style.display = show ? 'block' : 'none';
-  if (show && map) {
-    requestAnimationFrame(() => map.invalidateSize());
-  }
+function styleFor(feature) {
+  const region = REGION_BY_ISO[feature.properties.iso];
+  const value = region ? state.values[region.key] : null;
+  const fill = colorFor(state.varKey, value) || '#cbd5e1';
+  const selected = region && region.key === state.selected;
+  return {
+    fillColor: fill,
+    fillOpacity: value == null ? 0.25 : 0.78,
+    color: selected ? '#0b5fa5' : 'rgba(255,255,255,.9)',
+    weight: selected ? 3 : 1.2,
+    className: selected ? 'region-shape is-selected' : 'region-shape'
+  };
+}
+
+function render() {
+  if (!geoLayer) return;
+  geoLayer.setStyle(styleFor);
+  geoLayer.eachLayer(l => {
+    const region = REGION_BY_ISO[l.feature.properties.iso];
+    if (region && region.key === state.selected) l.bringToFront();
+  });
+
+  labelLayer.clearLayers();
+  const v = VARIABLES[state.varKey];
+  geojson.features.forEach(f => {
+    const region = REGION_BY_ISO[f.properties.iso];
+    if (!region) return;
+    const value = state.values[region.key];
+    const bg = colorFor(state.varKey, value) || '#cbd5e1';
+    const selected = region.key === state.selected;
+    const html = `
+      <button type="button" class="map-label${selected ? ' is-selected' : ''}" style="--lbl-bg:${bg};--lbl-fg:${textOn(bg)}"
+        aria-label="${region.name} : ${formatValue(state.varKey, value)} ${v.unit}">
+        <span class="map-label-value">${formatValue(state.varKey, value)}</span>
+        <span class="map-label-name">${region.name}</span>
+      </button>`;
+    const icon = L.divIcon({ className: 'map-label-wrap', html, iconSize: [0, 0] });
+    L.marker(LABEL_OVERRIDES[f.properties.iso] || f.properties.label, { icon, keyboard: false, zIndexOffset: selected ? 1000 : 0 })
+      .on('click', () => onSelect(region.key))
+      .addTo(labelLayer);
+  });
 }
 
 /**
- * Update map labels with the selected parameter values.
- * @param {Object} dailyData — { regionKey: { date: { daytime: {...} } } }
- * @param {string} param — selected parameter key
- * @param {string|null} date — specific date or null for today
- * @param {Function} onRegionClick — callback(regionKey)
+ * @param {Object} values  { regionKey: number|null }
+ * @param {string} varKey  clé de VARIABLES
+ * @param {string|null} selected  région sélectionnée
  */
-export function updateMapLabels(dailyData, param, date, onRegionClick) {
-  if (!map) initMap();
-
-  // Clear previous layers
-  layers.forEach(l => map.removeLayer(l));
-  layers = [];
-
-  const today = new Date().toISOString().split('T')[0];
-  const targetDate = date || today;
-
-  Object.entries(REGIONS).forEach(([key, { lat, lon }]) => {
-    const regionDates = dailyData[key];
-    if (!regionDates) return;
-
-    const dayData = regionDates[targetDate];
-    if (!dayData || !dayData.daytime) return;
-
-    const { value, unit, cssClass } = extractValue(dayData.daytime, param);
-    if (value == null) return;
-
-    const icon = L.divIcon({
-      className: 'region-label',
-      html: `
-        <div class="label-bg ${cssClass}">
-          <span class="label-value">${value}</span>
-          <span class="label-unit">${unit}</span>
-        </div>
-        <div class="label-name">${formatRegionName(key)}</div>
-      `,
-      iconSize: [60, 70],
-      iconAnchor: [30, 55]
-    });
-
-    const marker = L.marker([lat, lon], { icon, zIndexOffset: 1000 })
-      .addTo(map)
-      .on('click', () => onRegionClick(key));
-
-    layers.push(marker);
-  });
-
-  // Fit bounds if we have markers
-  if (layers.length > 0) {
-    const group = new L.featureGroup(layers);
-    map.fitBounds(group.getBounds().pad(0.15));
-  }
-}
-
-function extractValue(daytime, param) {
-  const d = daytime;
-  switch (param) {
-    case 'temperature':
-      return { value: d.temperature?.max, unit: '°C', cssClass: d.temperature?.max > 35 ? 'hot' : d.temperature?.max < 25 ? 'cold' : '' };
-    case 'precipitation':
-      return { value: d.precipitation?.probability, unit: '%', cssClass: d.precipitation?.probability > 50 ? 'wet' : '' };
-    case 'humidity':
-      return { value: d.humidity, unit: '%', cssClass: d.humidity > 70 ? 'wet' : '' };
-    case 'wind':
-      return { value: d.wind?.speed, unit: 'km/h', cssClass: d.wind?.speed > 30 ? 'wind' : '' };
-    case 'uv':
-      return { value: d.uv, unit: 'UV', cssClass: d.uv > 7 ? 'uv' : d.uv > 4 ? 'hot' : '' };
-    case 'cape':
-      return { value: d.cape, unit: 'J/kg', cssClass: d.cape > 1000 ? 'hot' : '' };
-    case 'surface_pressure':
-      return { value: d.surfacePressure, unit: 'hPa', cssClass: 'pressure' };
-    case 'soil_temperature_0_to_7cm':
-      return { value: d.soilTemp, unit: '°C', cssClass: 'soil' };
-    case 'soil_moisture_0_to_7cm':
-      return { value: d.soilMoisture, unit: 'm³/m³', cssClass: d.soilMoisture > 0.3 ? 'wet' : 'soil' };
-    default:
-      return { value: d.temperature?.max, unit: '°C', cssClass: '' };
-  }
-}
-
-function formatRegionName(key) {
-  return key.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+export function updateMap(values, varKey, selected) {
+  state = { values, varKey, selected };
+  render();
 }
