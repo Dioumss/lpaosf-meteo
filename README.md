@@ -12,6 +12,10 @@ Application web (PWA) de prévisions météo à 14 jours pour les 14 régions du
 - **Détail d'une région** : conditions actuelles, chiffres clés du jour, graphique heure par heure (température et pluie, avec infobulle), prévisions sur 14 jours.
 - **Points d'attention** : forte chaleur, fortes pluies, instabilité, vent fort, UV extrêmes. Ce sont des seuils indicatifs, pas la vigilance officielle de l'ANACIM.
 - **Classement** des 14 régions pour la variable affichée.
+- **Français / English** : bouton FR/EN en haut à droite. Au premier lancement, la langue suit celle du navigateur ; le choix est ensuite mémorisé. On peut aussi forcer la langue dans l'adresse : `?lang=en`.
+- **Ma position** : le bouton viseur sélectionne la région dont le chef-lieu est le plus proche de vous et affiche votre position sur la carte.
+- **Lien partageable** : l'adresse reflète la vue (`#r=matam&v=precipProbability&d=2026-10-16`). Le bouton lien la copie (ou ouvre le partage sur mobile).
+- **Repère « maintenant »** sur le graphique horaire du jour.
 - Mode sombre automatique, utilisable sur mobile, installable comme application.
 
 ## Fiabilité
@@ -38,6 +42,7 @@ js/
   app.js      interface : contrôles, carte, détail, graphique, actualisation
   api.js      requête Open-Meteo, nouvelles tentatives, cache local
   config.js   variables, classes de couleurs, codes météo, icônes SVG
+  i18n.js     textes français et anglais
   map.js      carte Leaflet choroplèthe
 assets/
   regions.geojson   limites des 14 régions (geoBoundaries, simplifiées)
@@ -59,6 +64,10 @@ python3 -m http.server 8000
 - Les prévisions sont calculées aux **chefs-lieux** de région, pas en moyenne sur la région.
 - CAPE, pression et sol sont agrégés depuis les données horaires (CAPE : maximum ; les autres : moyenne).
 - Limites administratives : [geoBoundaries](https://www.geoboundaries.org/) SEN ADM1, licence CC BY 3.0 IGO.
+
+## Modifier ou ajouter des textes
+
+Tous les textes sont dans `js/i18n.js`, une clé par texte, en français (`fr`) et en anglais (`en`). Pour ajouter une langue (wolof, par exemple), copiez le bloc `fr`, traduisez-le et ajoutez son code à `LANGS`.
 
 ## Modifier les seuils de couleur
 

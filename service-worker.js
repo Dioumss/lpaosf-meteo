@@ -7,7 +7,7 @@
 //   horodaté, pour pouvoir afficher l'âge des données).
 // ============================================
 
-const VERSION = 'v2.0.0';
+const VERSION = 'v2.1.0';
 const SHELL_CACHE = `lpaosf-shell-${VERSION}`;
 const RUNTIME_CACHE = `lpaosf-runtime-${VERSION}`;
 const MAX_RUNTIME_ENTRIES = 300;
@@ -21,6 +21,7 @@ const SHELL = [
   './js/api.js',
   './js/map.js',
   './js/config.js',
+  './js/i18n.js',
   './assets/regions.geojson',
   './assets/icon-192.png',
   './assets/icon-512.png',

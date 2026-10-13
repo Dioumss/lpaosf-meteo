@@ -4,6 +4,7 @@
 
 import { REGION_BY_ISO } from './api.js';
 import { VARIABLES, colorFor, textOn, formatValue } from './config.js';
+import { t } from './i18n.js';
 
 const SENEGAL_BOUNDS = [[12.25, -17.6], [16.75, -11.3]];
 // Carte thématique sans fond tuilé : aucune dépendance à un fournisseur de
@@ -12,22 +13,23 @@ const SENEGAL_BOUNDS = [[12.25, -17.6], [16.75, -11.3]];
 const LABEL_OVERRIDES = { 'SN-DK': [14.70, -17.42], 'SN-TH': [14.80, -16.78] };
 
 const PLACE_LABELS = [
-  { text: 'Océan Atlantique', at: [13.6, -17.25], cls: 'sea' },
-  { text: 'Gambie', at: [13.42, -15.5], cls: 'country' },
-  { text: 'Mauritanie', at: [16.55, -13.3], cls: 'country' },
-  { text: 'Mali', at: [14.2, -11.75], cls: 'country' },
-  { text: 'Guinée', at: [12.38, -12.9], cls: 'country' },
-  { text: 'Guinée-Bissau', at: [12.3, -15.6], cls: 'country' }
+  { key: 'place.sea', at: [13.6, -17.25], cls: 'sea' },
+  { key: 'place.gm', at: [13.42, -15.5], cls: 'country' },
+  { key: 'place.mr', at: [16.55, -13.3], cls: 'country' },
+  { key: 'place.ml', at: [14.2, -11.75], cls: 'country' },
+  { key: 'place.gn', at: [12.38, -12.9], cls: 'country' },
+  { key: 'place.gw', at: [12.3, -15.6], cls: 'country' }
 ];
+const ATTRIBUTION = () => `${t('map.limits')} <a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a>`;
 
-let map, geoLayer, labelLayer;
+let map, geoLayer, labelLayer, placeLayer, attribution;
 let geojson = null;
 let onSelect = () => {};
 let state = { values: {}, varKey: 'tempMax', selected: null };
 
 export async function initMap(container, { onRegionSelect }) {
   onSelect = onRegionSelect;
-  if (typeof L === 'undefined') throw new Error('Leaflet non chargé');
+  if (typeof L === 'undefined') throw new Error('Leaflet not loaded');
 
   map = L.map(container, {
     zoomControl: false,
@@ -38,13 +40,11 @@ export async function initMap(container, { onRegionSelect }) {
     maxBounds: [[10.5, -20], [18.5, -9.5]]
   });
   map.attributionControl.setPrefix(false);
-  map.attributionControl.addAttribution('Limites : <a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a>');
+  attribution = ATTRIBUTION();
+  map.attributionControl.addAttribution(attribution);
   L.control.zoom({ position: 'topright' }).addTo(map);
-
-  PLACE_LABELS.forEach(p => L.marker(p.at, {
-    icon: L.divIcon({ className: `place-label place-${p.cls}`, html: `<span>${p.text}</span>`, iconSize: [0, 0] }),
-    interactive: false, keyboard: false
-  }).addTo(map));
+  placeLayer = L.layerGroup().addTo(map);
+  renderPlaces();
 
   map.fitBounds(SENEGAL_BOUNDS, { padding: [4, 4] });
   // Étiquettes compactes (valeur seule) quand la carte est petite
@@ -80,6 +80,24 @@ export async function initMap(container, { onRegionSelect }) {
   render();
 }
 
+function renderPlaces() {
+  placeLayer.clearLayers();
+  PLACE_LABELS.forEach(p => L.marker(p.at, {
+    icon: L.divIcon({ className: `place-label place-${p.cls}`, html: `<span>${t(p.key)}</span>`, iconSize: [0, 0] }),
+    interactive: false, keyboard: false
+  }).addTo(placeLayer));
+}
+
+/** Retraduit les textes de la carte après un changement de langue. */
+export function refreshMapLanguage() {
+  if (!map) return;
+  map.attributionControl.removeAttribution(attribution);
+  attribution = ATTRIBUTION();
+  map.attributionControl.addAttribution(attribution);
+  renderPlaces();
+  render();
+}
+
 function styleFor(feature) {
   const region = REGION_BY_ISO[feature.properties.iso];
   const value = region ? state.values[region.key] : null;
@@ -112,7 +130,7 @@ function render() {
     const selected = region.key === state.selected;
     const html = `
       <button type="button" class="map-label${selected ? ' is-selected' : ''}" style="--lbl-bg:${bg};--lbl-fg:${textOn(bg)}"
-        aria-label="${region.name} : ${formatValue(state.varKey, value)} ${v.unit}">
+        aria-label="${region.name}: ${formatValue(state.varKey, value)} ${v.unit}">
         <span class="map-label-value">${formatValue(state.varKey, value)}</span>
         <span class="map-label-name">${region.name}</span>
       </button>`;
@@ -131,4 +149,14 @@ function render() {
 export function updateMap(values, varKey, selected) {
   state = { values, varKey, selected };
   render();
+}
+
+let userMarker = null;
+/** Affiche la position de l'utilisateur (point bleu). */
+export function showUserLocation(lat, lon) {
+  if (!map) return;
+  if (userMarker) map.removeLayer(userMarker);
+  userMarker = L.circleMarker([lat, lon], {
+    radius: 7, color: '#ffffff', weight: 2.5, fillColor: '#1479c8', fillOpacity: 1, interactive: false
+  }).addTo(map);
 }

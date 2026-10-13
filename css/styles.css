@@ -131,13 +131,26 @@ a { color: var(--accent); }
 .panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 .panel-title { font-size: 16px; font-weight: 650; }
 .panel-sub { font-size: 13.5px; color: var(--text-2); }
-.select-wrap select {
+.head-tools { display: flex; align-items: center; gap: 6px; flex: none; }
+.head-tools select {
   appearance: none; -webkit-appearance: none;
   font: inherit; font-weight: 600; color: var(--text);
   background: var(--surface-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 10px center;
   border: 1px solid var(--border); border-radius: 999px;
-  padding: 7px 32px 7px 14px; min-height: 38px;
+  padding: 7px 32px 7px 14px; min-height: 38px; min-width: 0;
 }
+.lang-btn { font-size: 12.5px; font-weight: 700; letter-spacing: .04em; }
+.icon-btn.is-busy svg { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+.nearest-note { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 13px; color: var(--accent); }
+.nearest-note .dot { width: 9px; height: 9px; border-radius: 50%; background: #1479c8; box-shadow: 0 0 0 2px #fff, 0 0 0 3px #1479c8; }
+.toast {
+  position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom)); transform: translateX(-50%);
+  background: var(--text); color: var(--surface); padding: 9px 16px; border-radius: 999px;
+  font-size: 14px; font-weight: 600; box-shadow: var(--shadow); z-index: 2000;
+}
+.chart .now-line { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 2 3; }
+.chart .now-label { fill: var(--accent); font-weight: 700; }
 
 /* Puces de variables */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; padding-bottom: 4px; }
@@ -330,7 +343,8 @@ a { color: var(--accent); }
   .brand-sub { font-size: 12px; }
   #map { height: auto; aspect-ratio: 5 / 4; }
   .panel-head { flex-direction: column; }
-  .select-wrap, .select-wrap select { width: 100%; }
+  .head-tools { width: 100%; }
+  .head-tools select { flex: 1; }
   .hero-temp { font-size: 44px; }
   .hero-facts, .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .ranking-list { grid-template-columns: minmax(0, 1fr); }

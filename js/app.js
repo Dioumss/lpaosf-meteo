@@ -4,10 +4,11 @@
 
 import { REGIONS, REGION_BY_KEY, loadForecast, getCachedForecast, MAX_AGE_MS } from './api.js';
 import {
-  VARIABLES, VARIABLE_ORDER, colorFor, textOn, formatValue, classIndex,
-  describeWeather, weatherIcon, windDirection
+  VARIABLES, VARIABLE_ORDER, colorFor, textOn, formatValue,
+  varLabel, varShort, classLabel, describeWeather, weatherIcon, windDirection
 } from './config.js';
-import { initMap, updateMap } from './map.js';
+import { initMap, updateMap, refreshMapLanguage, showUserLocation } from './map.js';
+import { t, getLang, setLang, locale, applyStatic, errorText } from './i18n.js';
 
 /* ---------- Préférences (mémorisées dans le navigateur) ---------- */
 const PREF_KEY = 'lpaosf:prefs:v2';
@@ -18,25 +19,38 @@ function savePrefs() {
   try { localStorage.setItem(PREF_KEY, JSON.stringify({ region: state.region, varKey: state.varKey })); } catch { /* ignore */ }
 }
 
+/* ---------- Lien partageable : #r=dakar&v=tempMax&d=2026-10-14 ---------- */
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  return { region: p.get('r'), varKey: p.get('v'), date: p.get('d') };
+}
+function writeHash() {
+  const p = new URLSearchParams({ r: state.region, v: state.varKey });
+  if (state.date && state.date !== availableDates()[0]) p.set('d', state.date);
+  history.replaceState(null, '', `#${p}`);
+}
+
 const prefs = readPrefs();
+const fromHash = readHash();
 const state = {
   data: null,
   fetchedAt: null,
   fromCache: false,
   error: null,
   loading: false,
-  region: REGION_BY_KEY[prefs.region] ? prefs.region : 'dakar',
-  varKey: VARIABLES[prefs.varKey] ? prefs.varKey : 'tempMax',
-  date: null
+  region: [fromHash.region, prefs.region].find(k => REGION_BY_KEY[k]) || 'dakar',
+  varKey: [fromHash.varKey, prefs.varKey].find(k => VARIABLES[k]) || 'tempMax',
+  date: /^\d{4}-\d{2}-\d{2}$/.test(fromHash.date || '') ? fromHash.date : null,
+  nearest: null
 };
 
 /* ---------- DOM ---------- */
 const $ = id => document.getElementById(id);
 const el = {
-  status: $('status'), refresh: $('refreshBtn'), banner: $('banner'),
-  regionSelect: $('regionSelect'), chips: $('variableChips'), days: $('dayStrip'),
+  status: $('status'), refresh: $('refreshBtn'), lang: $('langBtn'), locate: $('locateBtn'), share: $('shareBtn'),
+  banner: $('banner'), regionSelect: $('regionSelect'), chips: $('variableChips'), days: $('dayStrip'),
   mapSubtitle: $('mapSubtitle'), mapError: $('mapError'), legend: $('legend'),
-  ranking: $('rankingList'), detail: $('detail')
+  ranking: $('rankingList'), detail: $('detail'), footer: $('footerText'), toast: $('toast')
 };
 
 /* ---------- Dates (toujours en heure de Dakar) ---------- */
@@ -44,20 +58,24 @@ const TZ = 'Africa/Dakar';
 function todayDakar() {
   return new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 }
+function nowHourDakar() {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hourCycle: 'h23' }).format(new Date());
+}
 /** Formate une date « AAAA-MM-JJ » sans décalage de fuseau. */
 function fmtDate(iso, opts) {
   const [y, m, d] = iso.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('fr-FR', { timeZone: 'UTC', ...opts });
+  return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString(locale(), { timeZone: 'UTC', ...opts });
 }
 function fmtTime(ts) {
-  return new Date(ts).toLocaleTimeString('fr-FR', { timeZone: TZ, hour: '2-digit', minute: '2-digit' });
+  return new Date(ts).toLocaleTimeString(locale(), { timeZone: TZ, hour: '2-digit', minute: '2-digit' });
 }
+function fmtDayMonth(iso) { return fmtDate(iso, { day: 'numeric', month: 'long' }); }
 function relativeDay(iso) {
-  const t = todayDakar();
-  if (iso === t) return "Aujourd'hui";
-  const [y, m, d] = t.split('-').map(Number);
+  const today = todayDakar();
+  if (iso === today) return t('day.today');
+  const [y, m, d] = today.split('-').map(Number);
   const tomorrow = new Date(Date.UTC(y, m - 1, d + 1)).toISOString().slice(0, 10);
-  if (iso === tomorrow) return 'Demain';
+  if (iso === tomorrow) return t('day.tomorrow');
   return capitalize(fmtDate(iso, { weekday: 'long' }));
 }
 const capitalize = s => s.charAt(0).toUpperCase() + s.slice(1);
@@ -66,8 +84,8 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;'
 /** Jours disponibles à partir d'aujourd'hui (un cache de la veille est recadré). */
 function availableDates() {
   if (!state.data) return [];
-  const t = todayDakar();
-  return state.data.dates.filter(d => d >= t);
+  const today = todayDakar();
+  return state.data.dates.filter(d => d >= today);
 }
 
 function dayFor(regionKey, date) {
@@ -80,10 +98,8 @@ function buildControls() {
     .slice().sort((a, b) => a.name.localeCompare(b.name, 'fr'))
     .map(r => `<option value="${r.key}">${r.name}</option>`).join('');
   el.regionSelect.value = state.region;
-  el.regionSelect.addEventListener('change', () => selectRegion(el.regionSelect.value));
+  el.regionSelect.addEventListener('change', () => selectRegion(el.regionSelect.value, { scroll: false }));
 
-  el.chips.innerHTML = VARIABLE_ORDER.map(k => `
-    <button type="button" class="chip" role="radio" data-var="${k}" title="${VARIABLES[k].label}">${VARIABLES[k].short}</button>`).join('');
   el.chips.addEventListener('click', e => {
     const b = e.target.closest('[data-var]');
     if (!b) return;
@@ -110,17 +126,95 @@ function buildControls() {
   });
 
   el.refresh.addEventListener('click', () => refresh({ force: true }));
+  el.lang.addEventListener('click', () => switchLanguage(getLang() === 'fr' ? 'en' : 'fr'));
+  el.locate.addEventListener('click', locateMe);
+  el.share.addEventListener('click', shareView);
+  if (!('geolocation' in navigator)) el.locate.hidden = true;
+
+  window.addEventListener('hashchange', () => {
+    const h = readHash();
+    if (REGION_BY_KEY[h.region]) state.region = h.region;
+    if (VARIABLES[h.varKey]) state.varKey = h.varKey;
+    if (h.date) state.date = h.date;
+    el.regionSelect.value = state.region;
+    renderAll();
+  });
 }
 
-function selectRegion(key) {
+function renderTexts() {
+  applyStatic();
+  el.chips.innerHTML = VARIABLE_ORDER.map(k => `
+    <button type="button" class="chip" role="radio" data-var="${k}" title="${esc(varLabel(k))}">${esc(varShort(k))}</button>`).join('');
+  el.footer.innerHTML =
+    `${t('footer.forecast', { link: '<a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a>' })} ` +
+    t('footer.limits', { link: '<a href="https://www.geoboundaries.org/" target="_blank" rel="noopener">geoBoundaries</a>' });
+}
+
+function switchLanguage(lang) {
+  setLang(lang);
+  renderTexts();
+  refreshMapLanguage();
+  if (state.data) renderAll();
+  else if (state.error) showFatalError(state.error);
+  else renderStatus();
+}
+
+function selectRegion(key, { scroll = true } = {}) {
   if (!REGION_BY_KEY[key]) return;
   state.region = key;
   el.regionSelect.value = key;
   savePrefs();
   renderAll();
-  if (window.matchMedia('(max-width: 960px)').matches) {
+  if (scroll && window.matchMedia('(max-width: 960px)').matches) {
     document.querySelector('.detail-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
+}
+
+/* ---------- Géolocalisation : région du chef-lieu le plus proche ---------- */
+function distanceKm(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function locateMe() {
+  el.locate.classList.add('is-busy');
+  el.status.textContent = t('status.locating');
+  navigator.geolocation.getCurrentPosition(pos => {
+    el.locate.classList.remove('is-busy');
+    const me = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    const nearest = REGIONS.reduce((best, r) => (distanceKm(me, r) < distanceKm(me, best) ? r : best));
+    state.nearest = nearest.key;
+    showUserLocation(me.lat, me.lon);
+    selectRegion(nearest.key);
+  }, () => {
+    el.locate.classList.remove('is-busy');
+    renderStatus();
+    toast(t('error.geo'));
+  }, { enableHighAccuracy: false, timeout: 10000, maximumAge: 10 * 60 * 1000 });
+}
+
+/* ---------- Partage ---------- */
+async function shareView() {
+  writeHash();
+  const url = location.href;
+  try {
+    if (navigator.share && window.matchMedia('(pointer: coarse)').matches) {
+      await navigator.share({ title: `Météo LPAOSF · ${REGION_BY_KEY[state.region].name}`, url });
+      return;
+    }
+    await navigator.clipboard.writeText(url);
+    toast(t('share.done'));
+  } catch { /* partage annulé */ }
+}
+
+let toastTimer;
+function toast(msg) {
+  el.toast.textContent = msg;
+  el.toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.toast.hidden = true; }, 2200);
 }
 
 /* ---------- Rendu ---------- */
@@ -130,7 +224,7 @@ function renderAll() {
 
   const dates = availableDates();
   if (!dates.length) {
-    el.detail.innerHTML = '<p class="empty">Les données en cache sont trop anciennes. Actualisez pour obtenir les prévisions du jour.</p>';
+    el.detail.innerHTML = `<p class="empty">${t('cache.tooOld')}</p>`;
     return;
   }
   if (!dates.includes(state.date)) state.date = dates[0];
@@ -140,6 +234,7 @@ function renderAll() {
   renderMapAndLegend();
   renderRanking();
   renderDetail(dates);
+  writeHash();
 }
 
 function renderStatus() {
@@ -147,22 +242,23 @@ function renderStatus() {
   el.refresh.classList.toggle('is-spinning', loading);
   el.refresh.disabled = loading;
 
-  if (loading && !fetchedAt) { el.status.textContent = 'Chargement…'; }
-  else if (loading) { el.status.textContent = 'Actualisation…'; }
-  else if (fetchedAt) { el.status.textContent = `${fromCache && error ? 'Hors ligne · ' : ''}Mis à jour à ${fmtTime(fetchedAt)}`; }
-  else { el.status.textContent = 'Indisponible'; }
+  if (loading && !fetchedAt) el.status.textContent = t('status.loading');
+  else if (loading) el.status.textContent = t('status.refreshing');
+  else if (fetchedAt) el.status.textContent = (fromCache && error ? t('status.offline') : '') + t('status.updated', { time: fmtTime(fetchedAt) });
+  else el.status.textContent = t('status.unavailable');
   el.status.classList.toggle('is-warn', !!(fromCache && error));
 
   const age = fetchedAt ? Date.now() - fetchedAt : 0;
   if (error && fetchedAt) {
     el.banner.hidden = false;
     el.banner.className = 'banner is-warn';
-    el.banner.innerHTML = `Actualisation impossible (${esc(error.message)}). Affichage des prévisions du ${new Date(fetchedAt).toLocaleDateString('fr-FR', { timeZone: TZ, day: 'numeric', month: 'long' })} à ${fmtTime(fetchedAt)}. <button type="button" class="link-btn" data-retry>Réessayer</button>`;
+    const date = new Date(fetchedAt).toLocaleDateString(locale(), { timeZone: TZ, day: 'numeric', month: 'long' });
+    el.banner.innerHTML = `${esc(t('banner.failed', { error: errorText(error), date, time: fmtTime(fetchedAt) }))} <button type="button" class="link-btn" data-retry>${t('banner.retry')}</button>`;
     el.banner.querySelector('[data-retry]').onclick = () => refresh({ force: true });
   } else if (age > 6 * 3600 * 1000 && !loading) {
     el.banner.hidden = false;
     el.banner.className = 'banner is-warn';
-    el.banner.textContent = `Ces prévisions datent de plus de 6 heures.`;
+    el.banner.textContent = t('banner.old');
   } else {
     el.banner.hidden = true;
   }
@@ -179,8 +275,8 @@ function renderChips() {
 function renderDays(dates) {
   el.days.innerHTML = dates.map((d, i) => {
     const on = d === state.date;
-    const top = i === 0 ? "Auj." : capitalize(fmtDate(d, { weekday: 'short' }).replace('.', ''));
-    return `<button type="button" class="day${on ? ' is-active' : ''}" role="radio" aria-checked="${on}" data-date="${d}" aria-label="${relativeDay(d)} ${fmtDate(d, { day: 'numeric', month: 'long' })}">
+    const top = i === 0 ? t('day.todayShort') : capitalize(fmtDate(d, { weekday: 'short' }).replace('.', ''));
+    return `<button type="button" class="day${on ? ' is-active' : ''}" role="radio" aria-checked="${on}" data-date="${d}" aria-label="${relativeDay(d)} ${fmtDayMonth(d)}">
       <span class="day-name">${top}</span><span class="day-num">${fmtDate(d, { day: 'numeric' })}</span>
     </button>`;
   }).join('');
@@ -194,19 +290,19 @@ function valuesFor(varKey, date) {
 function renderMapAndLegend() {
   const v = VARIABLES[state.varKey];
   const values = valuesFor(state.varKey, state.date);
-  el.mapSubtitle.textContent = `${v.label}${v.unit ? ` (${v.unit})` : ''} · ${relativeDay(state.date)} ${fmtDate(state.date, { day: 'numeric', month: 'long' })}`;
+  el.mapSubtitle.textContent = `${varLabel(state.varKey)}${v.unit ? ` (${v.unit})` : ''} · ${relativeDay(state.date)} ${fmtDayMonth(state.date)}`;
   updateMap(values, state.varKey, state.region);
 
+  const f = n => n.toLocaleString(locale());
   const labels = v.colors.map((_, i) => {
-    if (v.classLabels) return v.classLabels[i];
+    if (v.hasClasses) return t(`class.${state.varKey}`)[i];
     const lo = v.breaks[i - 1], hi = v.breaks[i];
-    const f = n => n.toLocaleString('fr-FR');
     if (i === 0) return `< ${f(hi)}`;
     if (i === v.colors.length - 1) return `≥ ${f(lo)}`;
     return `${f(lo)}–${f(hi)}`;
   });
-  el.legend.innerHTML = `<span class="legend-unit">${v.unit || 'Indice'}</span>` + v.colors.map((c, i) =>
-    `<span class="legend-item"><span class="legend-swatch" style="background:${c}"></span>${labels[i]}</span>`).join('');
+  el.legend.innerHTML = `<span class="legend-unit">${v.unit || t('legend.index')}</span>` + v.colors.map((c, i) =>
+    `<span class="legend-item"><span class="legend-swatch" style="background:${c}"></span>${capitalize(labels[i])}</span>`).join('');
 }
 
 function renderRanking() {
@@ -227,7 +323,7 @@ function renderDetail(dates) {
   const region = REGION_BY_KEY[state.region];
   const rd = state.data.regions[state.region];
   const day = dayFor(state.region, state.date);
-  if (!day) { el.detail.innerHTML = '<p class="empty">Aucune donnée pour ce jour.</p>'; return; }
+  if (!day) { el.detail.innerHTML = `<p class="empty">${t('detail.noData')}</p>`; return; }
   const isToday = state.date === todayDakar();
   const wx = describeWeather(isToday ? rd.current.weatherCode : day.weatherCode);
 
@@ -241,68 +337,71 @@ function renderDetail(dates) {
         </div>
       </div>
       <dl class="hero-facts">
-        <div><dt>Ressenti</dt><dd>${formatValue('tempMax', rd.current.apparent)} °C</dd></div>
-        <div><dt>Humidité</dt><dd>${rd.current.humidity ?? '–'} %</dd></div>
-        <div><dt>Vent</dt><dd>${formatValue('windMax', rd.current.wind)} km/h ${windDirection(rd.current.windDir)}</dd></div>
-        <div><dt>Journée</dt><dd>${formatValue('tempMin', day.tempMin)} / ${formatValue('tempMax', day.tempMax)} °C</dd></div>
+        <div><dt>${t('detail.feels')}</dt><dd>${formatValue('tempMax', rd.current.apparent)} °C</dd></div>
+        <div><dt>${t('detail.humidity')}</dt><dd>${rd.current.humidity ?? '–'} %</dd></div>
+        <div><dt>${t('detail.wind')}</dt><dd>${formatValue('windMax', rd.current.wind)} km/h ${windDirection(rd.current.windDir)}</dd></div>
+        <div><dt>${t('detail.day')}</dt><dd>${formatValue('tempMin', day.tempMin)} / ${formatValue('tempMax', day.tempMax)} °C</dd></div>
       </dl>
-      <p class="hero-note">Observation modélisée à ${rd.current.time.slice(11, 16)} (heure de Dakar)</p>
+      <p class="hero-note">${t('detail.modelled', { time: rd.current.time.slice(11, 16) })}</p>
     </div>` : `
     <div class="hero">
       <div class="hero-main">
         ${weatherIcon(day.weatherCode, { size: 72 })}
         <div>
           <div class="hero-temp">${formatValue('tempMax', day.tempMax)}<span>°C</span></div>
-          <div class="hero-cond">${wx.label} · min ${formatValue('tempMin', day.tempMin)} °C</div>
+          <div class="hero-cond">${wx.label} · ${t('detail.min')} ${formatValue('tempMin', day.tempMin)} °C</div>
         </div>
       </div>
     </div>`;
 
-  const uvClass = day.uv != null ? VARIABLES.uv.classLabels[classIndex('uv', day.uv)] : '';
-  const capeClass = day.cape != null ? VARIABLES.cape.classLabels[classIndex('cape', day.cape)] : '';
+  const capeLevel = classLabel('cape', day.cape);
   const stats = [
-    ['Pluie', `${formatValue('precipSum', day.precipSum)} mm`, `Probabilité ${day.precipProbability ?? '–'} %`],
-    ['Vent max', `${formatValue('windMax', day.windMax)} km/h`, day.windDir != null ? `Dominant ${windDirection(day.windDir)}` : ''],
-    ['Humidité', `${day.humidity ?? '–'} %`, 'Moyenne journalière'],
-    ['UV max', `${formatValue('uv', day.uv)}`, uvClass],
-    ['CAPE max', `${formatValue('cape', day.cape)} J/kg`, capeClass ? `Instabilité ${capeClass.toLowerCase()}` : ''],
-    ['Pression', `${formatValue('pressure', day.pressure)} hPa`, 'Moyenne en surface'],
-    ['Sol 0–7 cm', `${formatValue('soilTemp', day.soilTemp)} °C`, `Humidité ${formatValue('soilMoisture', day.soilMoisture)} m³/m³`],
-    ['Soleil', `${day.sunrise ?? '–'}–${day.sunset ?? '–'}`, 'Lever – coucher']
+    [t('stat.rain'), `${formatValue('precipSum', day.precipSum)} mm`, t('stat.rainSub', { p: day.precipProbability ?? '–' })],
+    [t('stat.windMax'), `${formatValue('windMax', day.windMax)} km/h`, day.windDir != null ? t('stat.windSub', { dir: windDirection(day.windDir) }) : ''],
+    [t('stat.humidity'), `${day.humidity ?? '–'} %`, t('stat.humiditySub')],
+    [t('stat.uv'), `${formatValue('uv', day.uv)}`, classLabel('uv', day.uv) || ''],
+    [t('stat.cape'), `${formatValue('cape', day.cape)} J/kg`, capeLevel ? t('stat.capeSub', { level: capeLevel }) : ''],
+    [t('stat.pressure'), `${formatValue('pressure', day.pressure)} hPa`, t('stat.pressureSub')],
+    [t('stat.soil'), `${formatValue('soilTemp', day.soilTemp)} °C`, t('stat.soilSub', { v: formatValue('soilMoisture', day.soilMoisture) })],
+    [t('stat.sun'), `${day.sunrise ?? '–'}–${day.sunset ?? '–'}`, t('stat.sunSub')]
   ];
 
   const alerts = attentionPoints(day);
+  const nearestNote = state.nearest === state.region
+    ? `<p class="nearest-note"><span class="dot" aria-hidden="true"></span>${t('detail.nearest')}</p>` : '';
 
   el.detail.innerHTML = `
     <div class="detail-head">
       <h2 id="regionName" class="region-name">${region.name}</h2>
-      <p class="region-date">${relativeDay(state.date)} ${fmtDate(state.date, { day: 'numeric', month: 'long' })}</p>
+      <p class="region-date">${relativeDay(state.date)} ${fmtDayMonth(state.date)}</p>
     </div>
+    ${nearestNote}
     ${hero}
-    ${alerts.length ? `<ul class="alerts" aria-label="Points d'attention">${alerts.map(a => `<li class="alert alert-${a.level}">${a.text}</li>`).join('')}</ul>` : ''}
+    ${alerts.length ? `<ul class="alerts" aria-label="${t('section.alerts')}">${alerts.map(a => `<li class="alert alert-${a.level}">${a.text}</li>`).join('')}</ul>` : ''}
     <div class="stats">${stats.map(([k, v, s]) => `
       <div class="stat"><div class="stat-label">${k}</div><div class="stat-value">${v}</div>${s ? `<div class="stat-sub">${s}</div>` : ''}</div>`).join('')}
     </div>
 
-    <h3 class="section-title">Heure par heure</h3>
-    <div class="hourly-chart" id="hourlyChart">${hourlyChart(day.hours)}</div>
+    <h3 class="section-title">${t('section.hourly')}</h3>
+    <div class="hourly-chart" id="hourlyChart">${hourlyChart(day.hours, isToday)}</div>
 
-    <h3 class="section-title">Prévisions sur ${dates.length} jours</h3>
+    <h3 class="section-title">${t('section.forecast', { n: dates.length })}</h3>
     <ol class="forecast">${forecastRows(rd, dates)}</ol>
-    <p class="disclaimer">Seuils d'attention indicatifs. Pour la vigilance officielle, consultez les bulletins de l'ANACIM.</p>
+    <p class="disclaimer">${t('disclaimer')}</p>
   `;
   wireChart();
 }
 
 function attentionPoints(day) {
   const out = [];
-  if (day.tempMax >= 40) out.push({ level: 'high', text: `Forte chaleur : ${formatValue('tempMax', day.tempMax)} °C attendus.` });
-  else if (day.tempMax >= 37) out.push({ level: 'mid', text: `Chaleur marquée : ${formatValue('tempMax', day.tempMax)} °C.` });
-  if (day.precipSum >= 20) out.push({ level: 'high', text: `Fortes pluies : ${formatValue('precipSum', day.precipSum)} mm prévus.` });
-  else if (day.precipSum >= 5 && day.precipProbability >= 50) out.push({ level: 'mid', text: `Pluie probable : ${formatValue('precipSum', day.precipSum)} mm (${day.precipProbability} %).` });
-  if (day.cape >= 2500 && day.precipProbability >= 40) out.push({ level: 'mid', text: `Atmosphère très instable (CAPE ${formatValue('cape', day.cape)} J/kg) : orages possibles.` });
-  if (day.windMax >= 50) out.push({ level: 'high', text: `Vent fort : rafales moyennes jusqu'à ${formatValue('windMax', day.windMax)} km/h.` });
-  if (day.uv >= 11) out.push({ level: 'mid', text: `UV extrêmes (${formatValue('uv', day.uv)}) : protection indispensable.` });
+  const fv = (k, v) => formatValue(k, v);
+  if (day.tempMax >= 40) out.push({ level: 'high', text: t('alert.heatHigh', { v: fv('tempMax', day.tempMax) }) });
+  else if (day.tempMax >= 37) out.push({ level: 'mid', text: t('alert.heatMid', { v: fv('tempMax', day.tempMax) }) });
+  if (day.precipSum >= 20) out.push({ level: 'high', text: t('alert.rainHigh', { v: fv('precipSum', day.precipSum) }) });
+  else if (day.precipSum >= 5 && day.precipProbability >= 50) out.push({ level: 'mid', text: t('alert.rainMid', { v: fv('precipSum', day.precipSum), p: day.precipProbability }) });
+  if (day.cape >= 2500 && day.precipProbability >= 40) out.push({ level: 'mid', text: t('alert.storm', { v: fv('cape', day.cape) }) });
+  if (day.windMax >= 50) out.push({ level: 'high', text: t('alert.wind', { v: fv('windMax', day.windMax) }) });
+  if (day.uv >= 11) out.push({ level: 'mid', text: t('alert.uv', { v: fv('uv', day.uv) }) });
   return out;
 }
 
@@ -317,7 +416,7 @@ function forecastRows(rd, dates) {
     const on = d.date === state.date;
     const wx = describeWeather(d.weatherCode);
     return `<li><button type="button" class="fc-row${on ? ' is-active' : ''}" data-date="${d.date}" aria-pressed="${on}">
-      <span class="fc-day">${d.date === dates[0] ? "Aujourd'hui" : capitalize(fmtDate(d.date, { weekday: 'short', day: 'numeric' }))}</span>
+      <span class="fc-day">${d.date === dates[0] ? t('day.today') : capitalize(fmtDate(d.date, { weekday: 'short', day: 'numeric' }))}</span>
       <span class="fc-icon" title="${wx.label}">${weatherIcon(d.weatherCode, { size: 28 })}</span>
       <span class="fc-rain${d.precipProbability >= 30 ? ' is-visible' : ''}">${d.precipProbability ?? 0} %</span>
       <span class="fc-min">${formatValue('tempMin', d.tempMin)}°</span>
@@ -330,38 +429,48 @@ function forecastRows(rd, dates) {
 /* ---------- Graphique horaire (SVG, sans dépendance) ---------- */
 let chartHours = [];
 let chartW = 640;
-function hourlyChart(hours) {
+const CHART_PAD = { l: 34, r: 34, t: 18, b: 28 };
+
+function hourlyChart(hours, isToday) {
   chartHours = hours;
-  if (!hours.length) return '<p class="empty">Pas de données horaires.</p>';
+  if (!hours.length) return `<p class="empty">${t('chart.none')}</p>`;
   // Largeur réelle du conteneur : le texte garde sa taille sur mobile
   chartW = Math.max(300, Math.min(720, Math.round(el.detail.clientWidth || 640)));
-  const W = chartW, H = W < 480 ? 180 : 200, P = { l: 34, r: 34, t: 18, b: 28 };
+  const W = chartW, H = W < 480 ? 180 : 200, P = CHART_PAD;
   const iw = W - P.l - P.r, ih = H - P.t - P.b;
   const temps = hours.map(h => h.temperature).filter(v => v != null);
   const tMin = Math.floor(Math.min(...temps) - 1), tMax = Math.ceil(Math.max(...temps) + 1);
   const pMax = Math.max(5, ...hours.map(h => h.precipitation ?? 0));
   const x = i => P.l + (i + 0.5) * (iw / hours.length);
-  const yT = t => P.t + ih - ((t - tMin) / (tMax - tMin)) * ih;
+  const yT = v => P.t + ih - ((v - tMin) / (tMax - tMin)) * ih;
   const yP = p => P.t + ih - (p / pMax) * ih;
   const bw = (iw / hours.length) * 0.6;
 
-  const line = hours.map((h, i) => h.temperature == null ? null : `${x(i).toFixed(1)},${yT(h.temperature).toFixed(1)}`).filter(Boolean);
-  const area = `M${line[0]} L${line.join(' L')} L${x(hours.length - 1).toFixed(1)},${P.t + ih} L${x(0).toFixed(1)},${P.t + ih} Z`;
-  const bars = hours.map((h, i) => h.precipitation > 0
-    ? `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${yP(h.precipitation).toFixed(1)}" width="${bw.toFixed(1)}" height="${(P.t + ih - yP(h.precipitation)).toFixed(1)}" rx="1.5" class="bar"/>` : '').join('');
+  const pts = hours.map((h, i) => (h.temperature == null ? null : `${x(i).toFixed(1)},${yT(h.temperature).toFixed(1)}`)).filter(Boolean);
+  const area = `M${pts[0]} L${pts.join(' L')} L${x(hours.length - 1).toFixed(1)},${P.t + ih} L${x(0).toFixed(1)},${P.t + ih} Z`;
+  const bars = hours.map((h, i) => (h.precipitation > 0
+    ? `<rect x="${(x(i) - bw / 2).toFixed(1)}" y="${yP(h.precipitation).toFixed(1)}" width="${bw.toFixed(1)}" height="${(P.t + ih - yP(h.precipitation)).toFixed(1)}" rx="1.5" class="bar"/>` : '')).join('');
   const ticksT = [tMin, Math.round((tMin + tMax) / 2), tMax];
   const step = W < 480 ? 6 : 3;
-  const xLabels = hours.map((h, i) => i % step === 0 ? `<text x="${x(i).toFixed(1)}" y="${H - 8}" class="axis" text-anchor="middle">${h.hour.slice(0, 2)}h</text>` : '').join('');
+  const xLabels = hours.map((h, i) => (i % step === 0 ? `<text x="${x(i).toFixed(1)}" y="${H - 8}" class="axis" text-anchor="middle">${h.hour.slice(0, 2)}h</text>` : '')).join('');
+
+  // Repère « maintenant » sur la journée en cours
+  let nowMark = '';
+  if (isToday) {
+    const i = hours.findIndex(h => h.hour.slice(0, 2) === nowHourDakar());
+    if (i >= 0) nowMark = `<line x1="${x(i)}" x2="${x(i)}" y1="${P.t - 4}" y2="${P.t + ih}" class="now-line"/><text x="${x(i)}" y="${P.t - 7}" class="axis now-label" text-anchor="middle">${t('chart.now')}</text>`;
+  }
 
   return `
-  <div class="chart-legend"><span class="key key-temp"></span>Température (°C)<span class="key key-rain"></span>Pluie (mm/h)</div>
-  <svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Température et pluie heure par heure">
-    ${ticksT.map(t => `<line x1="${P.l}" x2="${W - P.r}" y1="${yT(t)}" y2="${yT(t)}" class="grid"/><text x="${P.l - 6}" y="${yT(t) + 4}" class="axis" text-anchor="end">${t}°</text>`).join('')}
+  <div class="chart-legend"><span class="key key-temp"></span>${t('chart.temp')}<span class="key key-rain"></span>${t('chart.rain')}</div>
+  <svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="${t('chart.aria')}">
+    ${ticksT.map(v => `<line x1="${P.l}" x2="${W - P.r}" y1="${yT(v)}" y2="${yT(v)}" class="grid"/><text x="${P.l - 6}" y="${yT(v) + 4}" class="axis" text-anchor="end">${v}°</text>`).join('')}
     <text x="${W - P.r + 6}" y="${P.t + 4}" class="axis axis-rain">${pMax.toFixed(0)}</text>
     <text x="${W - P.r + 6}" y="${P.t + ih + 4}" class="axis axis-rain">0</text>
+    ${nowMark}
     ${bars}
     <path d="${area}" class="temp-area"/>
-    <polyline points="${line.join(' ')}" class="temp-line"/>
+    <polyline points="${pts.join(' ')}" class="temp-line"/>
     ${xLabels}
     <line class="cursor" x1="0" x2="0" y1="${P.t}" y2="${P.t + ih}" visibility="hidden"/>
     <circle class="cursor-dot" r="4" cx="0" cy="0" visibility="hidden"/>
@@ -378,7 +487,7 @@ function wireChart() {
   const cursor = svg.querySelector('.cursor');
   const dot = svg.querySelector('.cursor-dot');
   const line = svg.querySelector('.temp-line').points;
-  const W = chartW, P = { l: 34, r: 34 };
+  const W = chartW, P = CHART_PAD;
   const iw = W - P.l - P.r;
 
   const show = evt => {
@@ -392,9 +501,10 @@ function wireChart() {
     dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
     cursor.setAttribute('visibility', 'visible'); dot.setAttribute('visibility', 'visible');
     tip.hidden = false;
-    tip.innerHTML = `<strong>${h.hour}</strong> · ${describeWeather(h.weatherCode).label}<br>
-      ${formatValue('tempMax', h.temperature)} °C · pluie ${formatValue('precipSum', h.precipitation)} mm (${h.precipProbability ?? '–'} %)<br>
-      vent ${formatValue('windMax', h.wind)} km/h · humidité ${h.humidity ?? '–'} %`;
+    tip.innerHTML = `<strong>${h.hour}</strong> · ${describeWeather(h.weatherCode).label}<br>` + t('chart.tip', {
+      t: formatValue('tempMax', h.temperature), p: formatValue('precipSum', h.precipitation),
+      pp: h.precipProbability ?? '–', w: formatValue('windMax', h.wind), h: h.humidity ?? '–'
+    });
     const px = (pt.x / W) * rect.width;
     tip.style.left = `${Math.min(Math.max(px, 90), rect.width - 90)}px`;
   };
@@ -417,7 +527,7 @@ async function refresh({ force = false } = {}) {
   inflight = (async () => {
     try {
       const res = await loadForecast({
-        onRetry: (n, total) => { el.status.textContent = `Connexion lente, tentative ${n}/${total}…`; }
+        onRetry: (n, total) => { el.status.textContent = t('status.retry', { n, total }); }
       });
       Object.assign(state, { data: res.data, fetchedAt: res.fetchedAt, fromCache: res.fromCache, error: res.error });
     } catch (error) {
@@ -434,25 +544,26 @@ async function refresh({ force = false } = {}) {
 
 function showFatalError(error) {
   const node = document.getElementById('errorTpl').content.cloneNode(true);
-  node.querySelector('.error-msg').textContent = `${error.message}. Vérifiez votre connexion puis réessayez.`;
+  applyStatic(node);
+  node.querySelector('.error-msg').textContent = t('error.hint', { error: errorText(error) });
   node.querySelector('.retry').addEventListener('click', () => refresh({ force: true }));
   el.detail.replaceChildren(node);
 }
 
 /* ---------- Démarrage ---------- */
 async function start() {
+  renderTexts();
   buildControls();
 
   // Affichage immédiat depuis le cache, puis actualisation en arrière-plan.
   const cached = getCachedForecast();
   if (cached) Object.assign(state, { data: cached.data, fetchedAt: cached.fetchedAt, fromCache: true });
 
-  initMap('map', { onRegionSelect: selectRegion })
+  initMap('map', { onRegionSelect: key => selectRegion(key) })
     .then(() => renderAll())
     .catch(err => {
       console.error(err);
       el.mapError.hidden = false;
-      el.mapError.textContent = 'Carte indisponible (fond de carte ou limites non chargés). Les prévisions restent consultables ci-contre.';
     });
 
   renderAll();
@@ -469,3 +580,4 @@ start();
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('service-worker.js').catch(() => {}));
 }
+

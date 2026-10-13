@@ -25,6 +25,8 @@ export const REGIONS = [
 export const REGION_BY_KEY = Object.fromEntries(REGIONS.map(r => [r.key, r]));
 export const REGION_BY_ISO = Object.fromEntries(REGIONS.map(r => [r.iso, r]));
 
+import { AppError } from './i18n.js';
+
 const ENDPOINT = 'https://api.open-meteo.com/v1/forecast';
 const TIMEZONE = 'Africa/Dakar';
 const FORECAST_DAYS = 14;
@@ -45,15 +47,15 @@ const HOURLY_VARS = [
   'cape', 'surface_pressure', 'soil_temperature_0_to_7cm', 'soil_moisture_0_to_7cm'
 ];
 
-const CACHE_KEY = 'lpaosf:forecast:v2';
+const CACHE_KEY = 'lpaosf:forecast:v3';
 /** Au-delà de cet âge, les données sont actualisées automatiquement. */
 export const MAX_AGE_MS = 30 * 60 * 1000;
 
 /* ---------- Réseau ---------- */
 
-class HttpError extends Error {
+class HttpError extends AppError {
   constructor(status) {
-    super(`Le serveur Open-Meteo a répondu ${status}`);
+    super('error.http', { status });
     this.status = status;
   }
 }
@@ -66,7 +68,7 @@ async function fetchWithTimeout(url, timeoutMs) {
     if (!res.ok) throw new HttpError(res.status);
     return await res.json();
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error('Délai de réponse dépassé');
+    if (e.name === 'AbortError') throw new AppError('error.timeout');
     throw e;
   } finally {
     clearTimeout(timer);
@@ -88,8 +90,8 @@ async function fetchJSONWithRetry(url, { timeouts = [12000, 20000, 30000], onRet
       await new Promise(r => setTimeout(r, 1000 * 2 ** i)); // 1 s, 2 s
     }
   }
-  if (!navigator.onLine) throw new Error('Pas de connexion Internet');
-  if (lastErr instanceof TypeError) throw new Error('Serveur météo injoignable');
+  if (!navigator.onLine) throw new AppError('error.noInternet');
+  if (lastErr instanceof TypeError) throw new AppError('error.unreachable');
   throw lastErr;
 }
 
@@ -151,7 +153,7 @@ function normalizeLocation(json) {
       humidity: d.relative_humidity_2m_mean[i],
       windMax: round(d.wind_speed_10m_max[i]),
       windDir: d.wind_direction_10m_dominant[i],
-      uv: round(d.uv_index_max[i]),
+      uv: round(d.uv_index_max[i], 0), // indice OMS : entier
       sunrise: d.sunrise[i]?.slice(11, 16) ?? null,
       sunset: d.sunset[i]?.slice(11, 16) ?? null,
       // Agrégats journaliers des variables uniquement horaires
@@ -183,7 +185,7 @@ function normalizeLocation(json) {
 function normalize(raw) {
   const list = Array.isArray(raw) ? raw : [raw];
   if (list.length !== REGIONS.length || !list.every(x => x?.daily?.time && x?.hourly?.time && x?.current)) {
-    throw new Error('Réponse Open-Meteo incomplète');
+    throw new AppError('error.incomplete');
   }
   const regions = {};
   REGIONS.forEach((r, i) => { regions[r.key] = normalizeLocation(list[i]); });
